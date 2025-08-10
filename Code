@@ -1,0 +1,224 @@
+"""
+Quora Question Pair Duplicate Detector
+
+import os
+import argparse
+import re
+import joblib
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from time import time
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, accuracy_score, classification_report
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+from collections import Counter
+
+# Optional fuzzy package: if not installed, the fallback functions below still run.
+try:
+    from fuzzywuzzy import fuzz
+except Exception:
+    fuzz = None
+
+# ---------- Utilities & Preprocessing ----------
+
+SAFE_DIV = 1e-4
+STOP_WORDS = set(stopwords.words("english")) if 'stopwords' in globals() else set()
+
+def simple_preprocess(text):
+    """Lowercase, expand a few contractions, replace some symbols, remove non-word chars."""
+    if pd.isna(text):
+        return ""
+    s = str(text).lower()
+    s = s.replace("won't", "will not").replace("can't", "can not").replace("n't", " not")
+    s = s.replace("'ve", " have").replace("'re", " are").replace("'ll", " will")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # simple stemming (light)
+    porter = PorterStemmer()
+    tokens = [porter.stem(t) for t in s.split()]
+    return " ".join(tokens)
+
+def tokenize(text):
+    return text.split()
+
+# ---------- Feature functions ----------
+
+def get_token_features(q1, q2):
+    """Return a list of 10 token-based features (safe for empty strings)."""
+    f = [0.0] * 10
+    t1 = q1.split()
+    t2 = q2.split()
+    if len(t1) == 0 or len(t2) == 0:
+        return f
+
+    w1 = set([w for w in t1 if w not in STOP_WORDS])
+    w2 = set([w for w in t2 if w not in STOP_WORDS])
+
+    s1 = set([w for w in t1 if w in STOP_WORDS])
+    s2 = set([w for w in t2 if w in STOP_WORDS])
+
+    common_words = len(w1 & w2)
+    common_stops = len(s1 & s2)
+    common_tokens = len(set(t1) & set(t2))
+
+    f[0] = common_words / (min(len(w1), len(w2)) + SAFE_DIV)
+    f[1] = common_words / (max(len(w1), len(w2)) + SAFE_DIV)
+    f[2] = common_stops / (min(len(s1), len(s2)) + SAFE_DIV)
+    f[3] = common_stops / (max(len(s1), len(s2)) + SAFE_DIV)
+    f[4] = common_tokens / (min(len(t1), len(t2)) + SAFE_DIV)
+    f[5] = common_tokens / (max(len(t1), len(t2)) + SAFE_DIV)
+    f[6] = int(t1[-1] == t2[-1])
+    f[7] = int(t1[0] == t2[0])
+    f[8] = abs(len(t1) - len(t2))
+    f[9] = (len(t1) + len(t2)) / 2.0
+    return f
+
+def longest_common_substring_ratio(a, b):
+    """Simple DP for longest common substring length ratio / min(len(a),len(b))."""
+    if not a or not b:
+        return 0.0
+    m, n = len(a), len(b)
+    dp = [0] * (n + 1)
+    best = 0
+    for i in range(1, m + 1):
+        new_dp = [0] * (n + 1)
+        for j in range(1, n + 1):
+            if a[i - 1] == b[j - 1]:
+                new_dp[j] = dp[j - 1] + 1
+                if new_dp[j] > best:
+                    best = new_dp[j]
+        dp = new_dp
+    return best / (min(m, n) + 1e-6)
+
+def safe_fuzzy_scores(a, b):
+    """Return a few fuzzy metrics if fuzzywuzzy is available, else zeros."""
+    if fuzz is None:
+        return {"fuzz_ratio": 0, "partial": 0, "token_sort": 0, "token_set": 0}
+    else:
+        return {
+            "fuzz_ratio": fuzz.QRatio(a, b),
+            "partial": fuzz.partial_ratio(a, b),
+            "token_sort": fuzz.token_sort_ratio(a, b),
+            "token_set": fuzz.token_set_ratio(a, b)
+        }
+
+# ---------- Main pipeline ----------
+
+def build_features(df, use_cache=True, cache_path="features_cache.parquet"):
+    """
+    Build a simple feature set:
+      - preprocessed q1/q2
+      - token-features (10)
+      - longest_substr_ratio
+      - fuzzy metrics (4)
+    Returns dataframe with features.
+    """
+    if use_cache and os.path.exists(cache_path):
+        print("Loading cached features:", cache_path)
+        return pd.read_parquet(cache_path)
+
+    df = df.copy()
+    print("Preprocessing text...")
+    df["q1_prep"] = df["question1"].fillna("").astype(str).apply(simple_preprocess)
+    df["q2_prep"] = df["question2"].fillna("").astype(str).apply(simple_preprocess)
+
+    print("Computing token-level features...")
+    token_feats = df.apply(lambda r: get_token_features(r["q1_prep"], r["q2_prep"]), axis=1)
+    token_mat = np.vstack(token_feats.values)
+    token_cols = [f"tok_feat_{i}" for i in range(token_mat.shape[1])]
+    for i, col in enumerate(token_cols):
+        df[col] = token_mat[:, i]
+
+    print("Computing longest substring ratio and fuzzy metrics...")
+    df["longest_substr_ratio"] = df.apply(lambda r: longest_common_substring_ratio(r["q1_prep"], r["q2_prep"]), axis=1)
+    fuzzy = df.apply(lambda r: pd.Series(safe_fuzzy_scores(r["q1_prep"], r["q2_prep"])), axis=1)
+    df = pd.concat([df, fuzzy], axis=1)
+
+    # select feature columns to return
+    feature_cols = token_cols + ["longest_substr_ratio", "fuzz_ratio", "partial", "token_sort", "token_set"]
+    features = df[feature_cols + ["q1_prep", "q2_prep", "is_duplicate", "id"]].copy()
+
+    if use_cache:
+        print("Saving features cache:", cache_path)
+        features.to_parquet(cache_path, index=False)
+
+    return features
+
+def train_model(df_features, out_dir, tfidf_max_features=30000):
+    """
+    Train a logistic regression classifier on:
+      - TF-IDF concatenation of q1 and q2
+      - engineered numeric features (scaled)
+    Saves model pipeline and vectorizer + scaler.
+    """
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    X_text = (df_features["q1_prep"] + " _sep_ " + df_features["q2_prep"]).values
+    y = df_features["is_duplicate"].values
+    X_num = df_features.drop(columns=["q1_prep", "q2_prep", "is_duplicate", "id"]).values
+
+    print("Splitting train/test...")
+    X_text_train, X_text_test, X_num_train, X_num_test, y_train, y_test = train_test_split(
+        X_text, X_num, y, test_size=0.2, random_state=42, stratify=y)
+
+    print("Fitting TF-IDF...")
+    tfidf = TfidfVectorizer(max_features=tfidf_max_features, ngram_range=(1, 2))
+    X_text_train_tfidf = tfidf.fit_transform(X_text_train)
+    X_text_test_tfidf = tfidf.transform(X_text_test)
+
+    # concat text features with numeric features
+    from scipy.sparse import hstack
+    X_train_full = hstack([X_text_train_tfidf, X_num_train])
+    X_test_full = hstack([X_text_test_tfidf, X_num_test])
+
+    print("Training classifier (LogisticRegression)...")
+    clf = LogisticRegression(C=1.0, solver="saga", max_iter=2000, class_weight="balanced", n_jobs=-1, random_state=42)
+    t0 = time()
+    clf.fit(X_train_full, y_train)
+    fit_time = time() - t0
+    print(f"Model trained in {fit_time:.1f}s")
+
+    y_proba = clf.predict_proba(X_test_full)[:, 1]
+    y_pred = clf.predict(X_test_full)
+    print("Evaluation on test set:")
+    print(" ROC-AUC:", roc_auc_score(y_test, y_proba))
+    print(" Accuracy:", accuracy_score(y_test, y_pred))
+    print(classification_report(y_test, y_pred, digits=4))
+
+    # Save artifacts
+    joblib.dump({"tfidf": tfidf, "clf": clf}, os.path.join(out_dir, "model_artifacts.joblib"))
+    print("Saved model artifacts to:", out_dir)
+
+    return {"tfidf": tfidf, "clf": clf}
+
+# ---------- CLI ----------
+
+def main(args):
+    data_path = args.data_path
+    out_dir = args.out_dir
+
+    print("Loading data from:", data_path)
+    df = pd.read_csv(data_path)
+    # Ensure required columns exist
+    for c in ["question1", "question2", "is_duplicate", "id"]:
+        if c not in df.columns:
+            raise ValueError(f"Expected column '{c}' in CSV")
+
+    features = build_features(df, use_cache=not args.no_cache, cache_path=os.path.join(out_dir, "features_cache.parquet"))
+    artifacts = train_model(features, out_dir, tfidf_max_features=args.tfidf_features)
+    print("Done. Example usage:")
+    print("  - To predict a single pair, load model_artifacts.joblib and call tfidf.transform on (q1+sep+q2)")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_path", type=str, required=True, help="Path to train.csv (Quora format)")
+    parser.add_argument("--out_dir", type=str, default="./output", help="Directory to save model/artifacts")
+    parser.add_argument("--no_cache", action="store_true", help="Don't write/read features cache")
+    parser.add_argument("--tfidf_features", type=int, default=30000, help="TF-IDF max features")
+    args = parser.parse_args()
+    main(args)
